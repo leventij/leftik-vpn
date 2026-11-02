@@ -1,0 +1,10 @@
+# Единые переводы строк на всех ПК
+* text=auto eol=lf
+
+# Скрипты Windows должны оставаться с CRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.nsh text eol=crlf
+
+*.png binary
+*.ico binary

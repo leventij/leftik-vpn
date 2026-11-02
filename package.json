@@ -1,0 +1,40 @@
+{
+  "name": "leftik-vpn",
+  "productName": "Leftik VPN",
+  "version": "1.0.0",
+  "description": "Leftik VPN — VLESS + Reality клиент с установкой своего сервера по IP, логину и паролю",
+  "main": "src/main/main.js",
+  "license": "MIT",
+  "scripts": {
+    "postinstall": "node scripts/fetch-core.js",
+    "start": "electron .",
+    "check": "node scripts/selftest.js",
+    "dist": "electron-builder --win"
+  },
+  "dependencies": {
+    "ssh2": "1.17.0"
+  },
+  "devDependencies": {
+    "electron": "44.7.2",
+    "electron-builder": "26.17.0"
+  },
+  "build": {
+    "appId": "vpn.leftik.app",
+    "productName": "Leftik VPN",
+    "directories": { "output": "dist" },
+    "npmRebuild": false,
+    "files": ["src/**/*", "package.json"],
+    "extraResources": [{ "from": "core", "to": "core", "filter": ["sing-box.exe"] }],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.png",
+      "requestedExecutionLevel": "requireAdministrator"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "include": "build/installer.nsh",
+      "shortcutName": "Leftik VPN"
+    }
+  }
+}
