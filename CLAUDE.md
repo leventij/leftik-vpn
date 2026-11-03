@@ -11,7 +11,8 @@ Desktop VPN client for Windows (Electron 44 + sing-box 1.14.3). VLESS + Reality:
 ## Layout
 - `src/main/main.js`: window, IPC, connect, kill switch wiring.
 - `src/main/singbox.js`: config builder (TUN -> VLESS, split tunneling rules) and the `Core` process manager.
-- `src/main/installer.js`: SSH install script for Xray on the server.
+- `src/main/installer.js`: SSH install script for Xray on the server. It runs only after the probe allows it.
+- `src/main/probe.js`: read-only server probe run before installing, plus the decision logic. It reuses a working VLESS Reality (from Leftik, a foreign Xray, or an Amnezia Docker container with keys in `/opt/amnezia/xray/*.key`). It refuses to overwrite a foreign Xray config or a busy port unless "Переустановить заново" is on.
 - `src/main/killswitch.js`: Windows Firewall kill switch via `netsh`.
 - `src/main/store.js`: settings in `%APPDATA%\Leftik VPN\leftik.json`. SSH passwords are never stored.
 - `src/renderer/`: UI (no framework, CSP `self` only).

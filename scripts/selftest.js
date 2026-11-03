@@ -8,6 +8,7 @@ const { parseVless, buildVless } = require('../src/main/vless');
 const { buildConfig, splitRouting } = require('../src/main/singbox');
 const { ruleCommands, restoreScript, RULE } = require('../src/main/killswitch');
 const { serverScript } = require('../src/main/installer');
+const { probeScript, parseProbe, analyzeProbe, realityPublicKey, MARK: PROBE_MARK } = require('../src/main/probe');
 
 const link = 'vless://0f9a2b3c-1d2e-4f50-8a9b-0c1d2e3f4a5b@203.0.113.10:443'
   + '?type=tcp&security=reality&flow=xtls-rprx-vision&sni=www.microsoft.com&fp=chrome'
@@ -30,6 +31,92 @@ console.log('ok  ws + tls');
 const script = serverScript({ port: 443, sni: 'www.microsoft.com; rm -rf /' });
 assert(!script.includes('rm -rf'), 'SNI должен очищаться от спецсимволов');
 console.log('ok  скрипт сервера экранирует SNI');
+
+// ---- Проверка сервера перед установкой ----
+// Эталонные пары ключей сгенерированы `sing-box generate reality-keypair`
+assert.strictEqual(realityPublicKey('WDxy2M_JDeTsLOciGh-G8Zp2juXNH-R6370JB7fzomA'), 'sv74lU1d4sTeKgmlYdxiMX-1A9sZl1kmgEF7eXYQok4');
+assert.strictEqual(realityPublicKey('6IRAFVBn_nQCUbxMJvNIw4seE9hmqhg6ZpAvIbIK13E'), 'OIV3qd9MeafJWxKfzrGoORndgNLkoaFNdpKr4JG1b2Q');
+assert.strictEqual(realityPublicKey('мусор'), null);
+console.log('ok  публичный ключ Reality из приватного');
+
+const UUID = '0f9a2b3c-1d2e-4f50-8a9b-0c1d2e3f4a5b';
+const PRIV = 'WDxy2M_JDeTsLOciGh-G8Zp2juXNH-R6370JB7fzomA';
+const PUB = 'sv74lU1d4sTeKgmlYdxiMX-1A9sZl1kmgEF7eXYQok4';
+const xrayConfig = ({ port = 443, uuid = UUID, listen = '0.0.0.0', security = 'reality', protocol = 'vless' } = {}) => JSON.stringify({
+  inbounds: [{
+    listen, port, protocol,
+    settings: { clients: [{ id: uuid, flow: 'xtls-rprx-vision' }], decryption: 'none' },
+    streamSettings: { network: 'tcp', security, realitySettings: { dest: 'www.microsoft.com:443', serverNames: ['www.microsoft.com'], privateKey: PRIV, shortIds: ['', 'ab12cd34'] } },
+  }],
+});
+// Вывод probe-скрипта собираем так же, как его печатает сервер: «LEFTIK_PROBE ключ base64»
+const probeOut = (items) => Object.entries(items)
+  .map(([k, v]) => `${PROBE_MARK}${k} ${Buffer.from(v).toString('base64')}`).concat(`${PROBE_MARK}done x`).join('\n');
+const decide = (items, opts = {}) => analyzeProbe(parseProbe(probeOut(items)), { port: 443, force: false, ...opts });
+
+let d = decide({ native: xrayConfig(), env: `UUID=${UUID}\nPRIV=${PRIV}\nPUB=${PUB}\nSID=ab12cd34`, native_active: 'active', port: 'LISTEN 0 4096 *:443 *:* users:(("xray",pid=812,fd=3))' });
+assert.strictEqual(d.action, 'reuse', 'Leftik уже стоит — не переустанавливаем');
+assert.deepStrictEqual({ src: d.found.source, pbk: d.found.pbk, sid: d.found.sid, sni: d.found.sni, port: d.found.port },
+  { src: 'leftik', pbk: PUB, sid: 'ab12cd34', sni: 'www.microsoft.com', port: 443 });
+
+d = decide({ native: xrayConfig({ port: 8443 }), native_active: 'active' });
+assert.strictEqual(d.action, 'reuse', 'чужой Xray с VLESS Reality тоже берём');
+assert.strictEqual(d.found.source, 'xray');
+assert.strictEqual(d.found.pbk, PUB, 'публичный ключ выведен из приватного');
+assert.strictEqual(d.found.port, 8443);
+
+d = decide({ native: xrayConfig(), native_active: 'inactive', port: '' });
+assert.strictEqual(d.action, 'error', 'остановленный чужой Xray не используем и не затираем');
+
+d = decide({
+  'docker:amnezia-xray': xrayConfig({ uuid: '11111111-2222-4333-8444-555555555555' }),
+  'dockerkey:amnezia-xray:uuid': 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+  'dockerkey:amnezia-xray:public': 'PUBFROMFILE',
+  'dockerkey:amnezia-xray:short_id': 'f00dbabe',
+  port: 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("docker-proxy",pid=99,fd=4))',
+});
+assert.strictEqual(d.action, 'reuse', 'VLESS от Amnezia в Docker берём готовым');
+assert.deepStrictEqual({ src: d.found.source, uuid: d.found.uuid, pbk: d.found.pbk, sid: d.found.sid },
+  { src: 'amnezia', uuid: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', pbk: 'PUBFROMFILE', sid: 'f00dbabe' }, 'ключи из файлов Amnezia важнее конфига');
+
+d = decide({ 'docker:amnezia-xray': xrayConfig(), port: 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("docker-proxy",pid=99,fd=4))' }, { force: true });
+assert.strictEqual(d.action, 'error', 'переустановка поверх занятого Amnezia порта невозможна');
+assert(/docker-proxy/.test(d.message) && /Amnezia/.test(d.message));
+
+d = decide({ native: xrayConfig({ listen: '127.0.0.1' }), native_active: 'active' });
+assert.strictEqual(d.action, 'error', 'вход только на localhost (за nginx) не годится, а чужой конфиг не трогаем');
+
+d = decide({ native: xrayConfig({ protocol: 'vmess' }), native_active: 'active' });
+assert.strictEqual(d.action, 'error');
+assert(/Переустановить заново/.test(d.message));
+assert.strictEqual(decide({ native: xrayConfig({ protocol: 'vmess' }), native_active: 'active' }, { force: true }).action, 'install');
+
+assert.strictEqual(decide({ port: '' }).action, 'install', 'чистый сервер — ставим');
+d = decide({ port: 'LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=1,fd=6))' });
+assert.strictEqual(d.action, 'error');
+assert(/nginx/.test(d.message));
+d = decide({ native: xrayConfig(), env: `UUID=${UUID}\nPUB=${PUB}`, native_active: 'active', port: 'LISTEN 0 4096 *:443 *:* users:(("xray",pid=812,fd=3))' }, { force: true });
+assert.strictEqual(d.action, 'install', 'переустановка Leftik поверх своего же Xray разрешена');
+console.log('ok  проверка сервера: Leftik, Xray, Amnezia, занятый порт, переустановка');
+
+// Синтаксис bash-скриптов для сервера (если есть bash — на Windows берём из Git)
+const bash = process.platform !== 'win32'
+  ? 'bash'
+  : ['C:\\Git\\bin\\bash.exe', 'C:\\Program Files\\Git\\bin\\bash.exe'].find((b) => fs.existsSync(b));
+if (bash) {
+  for (const [name, text] of [['probe', probeScript({ port: 443 })], ['install', serverScript({ port: 443, sni: 'www.microsoft.com' })]]) {
+    execFileSync(bash, ['-n'], { input: text, stdio: ['pipe', 'inherit', 'inherit'] });
+    if (name === 'probe') {
+      // Прогон «вхолостую»: файлов Xray тут нет, но формат вывода должен разбираться
+      const probe = parseProbe(execFileSync(bash, ['-s'], { input: text }).toString());
+      assert.strictEqual(typeof probe.port, 'string');
+      assert.strictEqual(probe.done, '');
+    }
+  }
+  console.log('ok  bash-скрипты сервера (синтаксис и формат вывода проверки)');
+} else {
+  console.log('--  bash не найден, проверка скриптов сервера пропущена');
+}
 
 const split = (apps, sites) => ({
   apps: { mode: apps, list: ['chrome.exe', 'telegram.exe'] },

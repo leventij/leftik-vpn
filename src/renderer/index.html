@@ -99,7 +99,7 @@
       </div>
 
       <form id="ownForm" class="form tab-own">
-        <p class="muted">Нужен VPS с Linux (Ubuntu / Debian / CentOS). Leftik подключится по SSH и установит Xray. Пароль нигде не сохраняется.</p>
+        <p class="muted">Нужен VPS с Linux (Ubuntu / Debian / CentOS). Leftik подключится по SSH и сначала проверит сервер: если VLESS Reality там уже есть (от Leftik на другом устройстве или от Amnezia), он просто возьмёт готовый ключ. Иначе установит Xray. Пароль нигде не сохраняется.</p>
         <label>IP-адрес сервера<input name="host" placeholder="203.0.113.10" required autocomplete="off"></label>
         <div class="row">
           <label>Логин<input name="username" value="root" required autocomplete="off"></label>
@@ -113,8 +113,12 @@
             <label>Маскировка (SNI)<input name="sni" value="www.microsoft.com" autocomplete="off"></label>
           </div>
           <label>Название<input name="name" placeholder="Например: США, Нью-Йорк" autocomplete="off"></label>
+          <div class="setting">
+            <p class="muted">Переустановить заново, даже если VLESS на сервере уже есть (нужно, чтобы сменить порт или маскировку)</p>
+            <label class="switch"><input type="checkbox" name="force"><span></span></label>
+          </div>
         </details>
-        <button id="installBtn" class="btn wide" type="submit">Установить и подключить</button>
+        <button id="installBtn" class="btn wide" type="submit">Подключить сервер</button>
         <pre id="installLog" class="log hidden"></pre>
       </form>
 

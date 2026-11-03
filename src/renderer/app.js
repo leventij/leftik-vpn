@@ -255,12 +255,14 @@ $('ownForm').addEventListener('submit', async (e) => {
   log.textContent = '';
   log.classList.remove('hidden');
   btn.disabled = true;
-  btn.textContent = 'Устанавливаю…';
+  btn.textContent = 'Проверяю сервер…';
   try {
-    state.store = await api.install(params);
+    const r = await api.install({ ...params, force: e.target.force.checked });
+    state.store = r.store;
     e.target.password.value = '';
+    e.target.force.checked = false;
     renderAll();
-    toast('Сервер установлен');
+    toast(r.reused ? 'VLESS на сервере уже был — ключ получен, ничего не переустанавливали' : 'Сервер установлен');
     go('home');
     api.connect().catch((err) => {
       showError($('homeError'), err.message === 'NEED_ADMIN'
@@ -271,7 +273,7 @@ $('ownForm').addEventListener('submit', async (e) => {
     showError($('addError'), err.message);
   } finally {
     btn.disabled = false;
-    btn.textContent = 'Установить и подключить';
+    btn.textContent = 'Подключить сервер';
   }
 });
 

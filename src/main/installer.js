@@ -1,5 +1,6 @@
 // Установка Xray (VLESS + Reality + Vision) на свой сервер по SSH: IP, логин, пароль
 const { Client } = require('ssh2');
+const { probeScript, parseProbe, analyzeProbe } = require('./probe');
 
 const MARK = 'LEFTIK_RESULT ';
 
@@ -28,6 +29,13 @@ if [ ! -x /usr/local/bin/xray ]; then
 fi
 XRAY=/usr/local/bin/xray
 mkdir -p $CONF_DIR
+
+# Чужой конфиг Xray (при «Переустановить заново») не удаляем, а откладываем в копию
+if [ -f $CONF_DIR/config.json ] && [ ! -f "$STATE" ]; then
+  BAK=$CONF_DIR/config.json.bak.$(date +%Y%m%d-%H%M%S)
+  cp $CONF_DIR/config.json "$BAK"
+  say "прежний конфиг Xray сохранён в $BAK"
+fi
 
 if [ -f "$STATE" ]; then
   say "найдена прошлая установка Leftik — использую её ключи"
@@ -149,50 +157,73 @@ function connectSsh({ host, sshPort, username, password }) {
   });
 }
 
+// Заливает скрипт во /tmp и выполняет от root (через sudo, если вошли не под root)
+async function runRemote(conn, { username, password }, name, script, onLine) {
+  const scriptPath = `/tmp/leftik-${name}.sh`;
+  await exec(conn, `cat > ${scriptPath} && chmod 700 ${scriptPath}`, { stdin: script });
+  const cmd = username === 'root'
+    ? `bash ${scriptPath}; R=$?; rm -f ${scriptPath}; exit $R`
+    : `sudo -k -S -p '' bash ${scriptPath}; R=$?; rm -f ${scriptPath}; exit $R`;
+  const res = await exec(conn, cmd, { stdin: username === 'root' ? undefined : `${password}\n`, onLine });
+  if (res.code !== 0 && /sudo|not in the sudoers/i.test(res.out)) {
+    throw new Error('Нет прав sudo у этого пользователя — войдите как root');
+  }
+  return res;
+}
+
+const SOURCE_NAMES = {
+  leftik: 'VLESS Reality, установленный Leftik',
+  amnezia: 'VLESS Reality от Amnezia',
+  xray: 'VLESS Reality (Xray)',
+};
+
+// Возвращает { server, reused }: reused — откуда взят уже работающий VLESS, если ставить не пришлось
 async function installServer(params, onLog = () => {}) {
   const { host, username, password } = params;
   const port = Number(params.port) || 443;
   const sni = (params.sni || 'www.microsoft.com').trim();
+  const force = params.force === true || params.force === 'on';
   if (!host || !username || !password) throw new Error('Заполните IP, логин и пароль');
+
+  const serverFrom = (r) => ({
+    name: params.name || `Leftik · ${host}`,
+    host,
+    port: r.port,
+    uuid: r.uuid,
+    security: 'reality',
+    transport: 'tcp',
+    flow: r.flow,
+    sni: r.sni,
+    fp: 'chrome',
+    pbk: r.pbk,
+    sid: r.sid,
+    selfHosted: true,
+  });
 
   onLog(`Подключаюсь по SSH к ${host}...`);
   const conn = await connectSsh(params);
   try {
-    onLog('SSH подключён, загружаю скрипт установки');
-    const scriptPath = '/tmp/leftik-install.sh';
-    await exec(conn, `cat > ${scriptPath} && chmod 700 ${scriptPath}`, { stdin: serverScript({ port, sni }) });
+    onLog('SSH подключён, проверяю, что уже есть на сервере');
+    const probeRes = await runRemote(conn, params, 'probe', probeScript({ port }));
+    const decision = analyzeProbe(parseProbe(probeRes.out), { port, force });
 
-    const cmd = username === 'root'
-      ? `bash ${scriptPath}; R=$?; rm -f ${scriptPath}; exit $R`
-      : `sudo -k -S -p '' bash ${scriptPath}; R=$?; rm -f ${scriptPath}; exit $R`;
-    const res = await exec(conn, cmd, {
-      stdin: username === 'root' ? undefined : `${password}\n`,
-      onLine: (l) => !l.startsWith(MARK) && onLog(l),
-    });
-
-    const line = res.out.split(/\r?\n/).find((l) => l.startsWith(MARK));
-    if (res.code !== 0 || !line) {
-      if (/sudo|password|not in the sudoers/i.test(res.out)) {
-        throw new Error('Нет прав sudo у этого пользователя — войдите как root');
+    if (decision.action === 'reuse') {
+      const f = decision.found;
+      onLog(`Найден работающий ${SOURCE_NAMES[f.source]} на порту ${f.port} — устанавливать заново не нужно`);
+      if (f.port !== port || f.sni !== sni) {
+        onLog(`Порт и маскировка взяты с сервера (${f.port}, ${f.sni}). Чтобы поменять их, включите «Переустановить заново».`);
       }
-      throw new Error(`Установка не удалась (код ${res.code}). Подробности в журнале.`);
+      return { server: serverFrom(f), reused: f.source };
     }
+    if (decision.action === 'error') throw new Error(decision.message);
+
+    onLog(force ? 'Переустанавливаю по запросу' : 'VLESS на сервере нет — устанавливаю');
+    const res = await runRemote(conn, params, 'install', serverScript({ port, sni }), (l) => !l.startsWith(MARK) && onLog(l));
+    const line = res.out.split(/\r?\n/).find((l) => l.startsWith(MARK));
+    if (res.code !== 0 || !line) throw new Error(`Установка не удалась (код ${res.code}). Подробности в журнале.`);
     const r = JSON.parse(line.slice(MARK.length));
     onLog('Сервер готов');
-    return {
-      name: params.name || `Leftik · ${host}`,
-      host,
-      port,
-      uuid: r.uuid,
-      security: 'reality',
-      transport: 'tcp',
-      flow: 'xtls-rprx-vision',
-      sni,
-      fp: 'chrome',
-      pbk: r.pbk,
-      sid: r.sid,
-      selfHosted: true,
-    };
+    return { server: serverFrom({ ...r, port, sni, flow: 'xtls-rprx-vision' }), reused: null };
   } finally {
     conn.end();
   }

@@ -140,10 +140,10 @@ app.whenReady().then(() => {
   ipcMain.handle('app:relaunchAdmin', () => relaunchAsAdmin());
 
   ipcMain.handle('server:install', async (_e, params) => {
-    const server = await installServer(params, (line) => send('install:log', line));
+    const { server, reused } = await installServer(params, (line) => send('install:log', line));
     const state = store.addServer(server);
     refreshKillSwitch();
-    return state;
+    return { store: state, reused };
   });
   ipcMain.handle('server:import', (_e, link) => {
     const state = store.addServer(parseVless(link));
