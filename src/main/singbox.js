@@ -6,6 +6,7 @@ const { spawn, execFile } = require('child_process');
 const { EventEmitter } = require('events');
 
 const API_PORT = 9095;
+const CHECK_PORT = 9096;
 const TUN_V4 = '172.19.0.1/30';
 const TUN_V6 = 'fdfe:dcba:9876::1/126';
 
@@ -79,6 +80,8 @@ function splitRouting(split = {}) {
 function buildConfig(server, settings = {}, ctx = {}) {
   const split = splitRouting(settings.split);
   const rules = [
+    // Служебный вход для проверки связи — всегда через сервер, мимо раздельного туннелирования
+    { inbound: ['check-in'], outbound: 'proxy' },
     { action: 'sniff' },
     { protocol: 'dns', action: 'hijack-dns' },
     { ip_is_private: true, outbound: 'direct' },
@@ -109,6 +112,7 @@ function buildConfig(server, settings = {}, ctx = {}) {
         strict_route: true,
         stack: 'mixed',
       },
+      { type: 'mixed', tag: 'check-in', listen: '127.0.0.1', listen_port: CHECK_PORT },
     ],
     outbounds: [buildOutbound(server), { type: 'direct', tag: 'direct' }],
     route: {
@@ -121,6 +125,53 @@ function buildConfig(server, settings = {}, ctx = {}) {
       clash_api: { external_controller: `127.0.0.1:${API_PORT}` },
     },
   };
+}
+
+// Проверка связи: обычный HTTP-запрос через служебный вход ядра, который всегда идёт через сервер.
+// В отличие от теста задержки Clash API, ошибка такого соединения попадает в журнал ядра.
+const CHECK_URL = 'http://cp.cloudflare.com/generate_204';
+
+// Время ответа через сервер в мс или null, если запрос не прошёл
+function delayTest() {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const req = http.get({
+      host: '127.0.0.1',
+      port: CHECK_PORT,
+      path: CHECK_URL,
+      headers: { Host: new URL(CHECK_URL).host },
+      timeout: 8000,
+    }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode === 204 ? Date.now() - start : null));
+    });
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => resolve(null));
+  });
+}
+
+// Понятная причина по ошибкам ядра. Известные случаи — с подсказкой, что делать.
+function explainCoreError(logs, { coreExe, server }) {
+  const text = logs.join('\n');
+  const where = server ? `${server.host}:${server.port}` : 'сервером';
+  if (/requested address is not valid in its context/i.test(text)) {
+    return `Соединение с сервером ${where} перехватывает антивирус или сетевой фильтр (например, Dr.Web SpIDer Gate). `
+      + `Добавьте в его исключения программу ${coreExe} (не проверять её трафик) и подключитесь снова.`;
+  }
+  if (/reality verification failed/i.test(text)) {
+    return `Сервер ${where} не принял подключение. Чаще всего на сервере стоит Xray 26.7 или новее — он несовместим с ядром Leftik. `
+      + 'Добавьте сервер заново по IP и паролю — Leftik сам поставит совместимую версию (если сервер ставили не через Leftik, включите «Переустановить заново»). '
+      + `Реже причина в устаревшем ключе или в антивирусе, который вмешивается в шифрованный трафик (тогда добавьте ${coreExe} в его исключения).`;
+  }
+  if (/outbound\/vless\[proxy\]: EOF/i.test(text)) {
+    return `Сервер ${where} обрывает подключение сразу после рукопожатия. Частая причина — сайт маскировки с большим сертификатом `
+      + '(например, www.microsoft.com). Добавьте сервер заново по IP и паролю — Leftik сам сменит маскировку на gateway.icloud.com.';
+  }
+  if (/i\/o timeout|connection timed out|actively refused|connection refused|No connection could be made/i.test(text)) {
+    return `Сервер ${where} не отвечает: проверьте, что он включён и порт открыт.`;
+  }
+  const last = logs.filter((l) => /ERROR|FATAL/.test(l)).pop();
+  return last ? `Сервер не отвечает: ${last.replace(/^.*?(ERROR|FATAL)\s*(\[[^\]]*\]\s*)?/, '')}` : `Нет связи с сервером ${where}.`;
 }
 
 // Добивает «осиротевшее» ядро (например, если окно Leftik упало). PID последнего запуска
@@ -206,16 +257,26 @@ class Core extends EventEmitter {
       }, 20000);
 
       let buf = '';
+      let started = false;
       const onData = (chunk) => {
         buf += chunk.toString();
         const lines = buf.split(/\r?\n/);
         buf = lines.pop();
         for (const l of lines) {
           this.log(l);
-          if (this.state === 'connecting' && /sing-box started/i.test(l)) {
-            this.setState('connected');
-            this.startTraffic();
-            finish();
+          if (!started && this.state === 'connecting' && /sing-box started/i.test(l)) {
+            started = true;
+            clearTimeout(timer);
+            // «Подключено» — только когда через сервер реально прошёл запрос
+            this.verify(gen, config, server).then(() => {
+              if (this.proc !== proc) return finish(new Error('CANCELLED'));
+              this.setState('connected');
+              this.startTraffic();
+              finish();
+            }).catch((err) => {
+              finish(err);
+              if (this.proc === proc) this.disconnect();
+            });
           }
         }
       };
@@ -275,6 +336,26 @@ class Core extends EventEmitter {
     }
   }
 
+  // Проверочный запрос через сервер (Clash API ядра: /proxies/proxy/delay). Две попытки.
+  async verify(gen, config, server) {
+    if (!config.inbounds?.some((i) => i.tag === 'check-in')) return null;
+    this.log('[leftik] проверяю связь с сервером…');
+    const since = this.logs.length;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const delay = await delayTest();
+      if (gen !== this.gen) throw new Error('CANCELLED');
+      if (delay != null) {
+        this.log(`[leftik] сервер отвечает: ${delay} мс`);
+        return delay;
+      }
+    }
+    // Ядро пишет ошибку соединения в журнал отдельно — даём ему долю секунды
+    await new Promise((r) => setTimeout(r, 300));
+    const reason = explainCoreError(this.logs.slice(since), { coreExe: this.exePath, server });
+    this.log(`[leftik] нет связи с сервером: ${reason}`);
+    throw new Error(reason);
+  }
+
   startTraffic() {
     this.stopTraffic();
     const req = http.get({ host: '127.0.0.1', port: API_PORT, path: '/traffic' }, (res) => {
@@ -305,4 +386,4 @@ class Core extends EventEmitter {
   }
 }
 
-module.exports = { Core, buildConfig, splitRouting, killStrayCores, TUN_V4, TUN_V6 };
+module.exports = { Core, buildConfig, splitRouting, killStrayCores, explainCoreError, TUN_V4, TUN_V6 };

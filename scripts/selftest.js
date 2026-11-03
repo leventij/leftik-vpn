@@ -5,10 +5,12 @@ const path = require('path');
 const assert = require('assert');
 const { execFileSync } = require('child_process');
 const { parseVless, buildVless } = require('../src/main/vless');
-const { buildConfig, splitRouting } = require('../src/main/singbox');
+const { buildConfig, splitRouting, explainCoreError } = require('../src/main/singbox');
 const { ruleCommands, restoreScript, RULE } = require('../src/main/killswitch');
-const { serverScript, installError } = require('../src/main/installer');
-const { probeScript, parseProbe, analyzeProbe, realityPublicKey, MARK: PROBE_MARK } = require('../src/main/probe');
+const { serverScript, installError, XRAY_VERSION } = require('../src/main/installer');
+const {
+  probeScript, parseProbe, analyzeProbe, realityPublicKey, xrayVersion, compatibleXray, MARK: PROBE_MARK, DEFAULT_SNI, BAD_MASK_SITES,
+} = require('../src/main/probe');
 
 const link = 'vless://0f9a2b3c-1d2e-4f50-8a9b-0c1d2e3f4a5b@203.0.113.10:443'
   + '?type=tcp&security=reality&flow=xtls-rprx-vision&sni=www.microsoft.com&fp=chrome'
@@ -32,6 +34,18 @@ const script = serverScript({ port: 443, sni: 'www.microsoft.com; rm -rf /' });
 assert(!script.includes('rm -rf'), 'SNI должен очищаться от спецсимволов');
 console.log('ok  скрипт сервера экранирует SNI');
 
+// Причины, которые видит пользователь, когда сервер не отвечает (строки — из настоящих журналов)
+const coreCtx = { coreExe: 'C:\\Program Files\\Leftik VPN\\resources\\core\\sing-box.exe', server: { host: '198.51.100.7', port: 443 } };
+let why = explainCoreError(['+0300 2026-11-03 10:33:35 ERROR [3753368944 303ms] connection: open connection to 172.64.41.4:443 using outbound/vless[proxy]: dial tcp 198.51.100.7:443: connectex: The requested address is not valid in its context.'], coreCtx);
+assert(/антивирус/.test(why) && why.includes(coreCtx.coreExe), why);
+why = explainCoreError(['ERROR[0002] [1305265580 1.2s] connection: open connection to cp.cloudflare.com:443 using outbound/vless[proxy]: reality verification failed'], coreCtx);
+assert(/Xray 26\.7 или новее/.test(why) && /не принял подключение/.test(why), why);
+assert(/не отвечает/.test(explainCoreError(['ERROR dial tcp 198.51.100.7:443: i/o timeout'], coreCtx)));
+why = explainCoreError(['+0300 2026-11-03 11:32:24 ERROR [3646655998 217ms] connection: open connection to cp.cloudflare.com:80 using outbound/vless[proxy]: EOF'], coreCtx);
+assert(/обрывает подключение/.test(why) && /gateway\.icloud\.com/.test(why), why);
+assert.strictEqual(explainCoreError([], coreCtx), 'Нет связи с сервером 198.51.100.7:443.');
+console.log('ok  понятные причины, когда сервер не отвечает');
+
 // ---- Проверка сервера перед установкой ----
 // Эталонные пары ключей сгенерированы `sing-box generate reality-keypair`
 assert.strictEqual(realityPublicKey('WDxy2M_JDeTsLOciGh-G8Zp2juXNH-R6370JB7fzomA'), 'sv74lU1d4sTeKgmlYdxiMX-1A9sZl1kmgEF7eXYQok4');
@@ -42,11 +56,11 @@ console.log('ok  публичный ключ Reality из приватного')
 const UUID = '0f9a2b3c-1d2e-4f50-8a9b-0c1d2e3f4a5b';
 const PRIV = 'WDxy2M_JDeTsLOciGh-G8Zp2juXNH-R6370JB7fzomA';
 const PUB = 'sv74lU1d4sTeKgmlYdxiMX-1A9sZl1kmgEF7eXYQok4';
-const xrayConfig = ({ port = 443, uuid = UUID, listen = '0.0.0.0', security = 'reality', protocol = 'vless' } = {}) => JSON.stringify({
+const xrayConfig = ({ port = 443, uuid = UUID, listen = '0.0.0.0', security = 'reality', protocol = 'vless', sni = 'gateway.icloud.com' } = {}) => JSON.stringify({
   inbounds: [{
     listen, port, protocol,
     settings: { clients: [{ id: uuid, flow: 'xtls-rprx-vision' }], decryption: 'none' },
-    streamSettings: { network: 'tcp', security, realitySettings: { dest: 'www.microsoft.com:443', serverNames: ['www.microsoft.com'], privateKey: PRIV, shortIds: ['', 'ab12cd34'] } },
+    streamSettings: { network: 'tcp', security, realitySettings: { dest: `${sni}:443`, serverNames: [sni], privateKey: PRIV, shortIds: ['', 'ab12cd34'] } },
   }],
 });
 // Вывод probe-скрипта собираем так же, как его печатает сервер: «LEFTIK_PROBE ключ base64»
@@ -57,7 +71,7 @@ const decide = (items, opts = {}) => analyzeProbe(parseProbe(probeOut(items)), {
 let d = decide({ native: xrayConfig(), env: `UUID=${UUID}\nPRIV=${PRIV}\nPUB=${PUB}\nSID=ab12cd34`, native_active: 'active', port: 'LISTEN 0 4096 *:443 *:* users:(("xray",pid=812,fd=3))' });
 assert.strictEqual(d.action, 'reuse', 'Leftik уже стоит — не переустанавливаем');
 assert.deepStrictEqual({ src: d.found.source, pbk: d.found.pbk, sid: d.found.sid, sni: d.found.sni, port: d.found.port },
-  { src: 'leftik', pbk: PUB, sid: 'ab12cd34', sni: 'www.microsoft.com', port: 443 });
+  { src: 'leftik', pbk: PUB, sid: 'ab12cd34', sni: 'gateway.icloud.com', port: 443 });
 
 d = decide({ native: xrayConfig({ port: 8443 }), native_active: 'active' });
 assert.strictEqual(d.action, 'reuse', 'чужой Xray с VLESS Reality тоже берём');
@@ -99,6 +113,56 @@ d = decide({ native: xrayConfig(), env: `UUID=${UUID}\nPUB=${PUB}`, native_activ
 assert.strictEqual(d.action, 'install', 'переустановка Leftik поверх своего же Xray разрешена');
 console.log('ok  проверка сервера: Leftik, Xray, Amnezia, занятый порт, переустановка');
 
+// ---- Версия Xray: 26.7+ отвергает REALITY от sing-box ----
+assert.deepStrictEqual(xrayVersion('Xray 26.10.21 (Xray, Penetrates Everything.) 0a1b2c3 (go1.25.3 linux/amd64)'), [26, 10, 21]);
+assert.strictEqual(xrayVersion('что-то другое'), null);
+assert(compatibleXray([26, 6, 27]) && compatibleXray([25, 12, 8]) && compatibleXray(null));
+assert(!compatibleXray([26, 7, 11]) && !compatibleXray([26, 9, 8]) && !compatibleXray([27, 1, 1]));
+assert.strictEqual(XRAY_VERSION, 'v26.6.27');
+assert(compatibleXray(xrayVersion(`Xray ${XRAY_VERSION.slice(1)} (x)`)), 'ставим совместимую версию');
+
+const XRAY_NEW = 'Xray 26.10.21 (Xray, Penetrates Everything.) abc (go1.25 linux/amd64)';
+const XRAY_OLD = 'Xray 26.6.27 (Xray, Penetrates Everything.) abc (go1.24 linux/amd64)';
+const leftikEnv = `UUID=${UUID}\nPRIV=${PRIV}\nPUB=${PUB}\nSID=ab12cd34`;
+const xrayOnPort = 'LISTEN 0 4096 *:443 *:* users:(("xray",pid=812,fd=3))';
+d = decide({ native: xrayConfig(), env: leftikEnv, native_active: 'active', native_version: XRAY_OLD, port: xrayOnPort });
+assert.strictEqual(d.action, 'reuse', 'совместимый Xray от Leftik — берём ключ');
+d = decide({ native: xrayConfig(), env: leftikEnv, native_active: 'active', native_version: XRAY_NEW, port: xrayOnPort });
+assert.strictEqual(d.action, 'install', 'свой Xray слишком новый — переставляем совместимый без «Переустановить»');
+assert(/26\.10\.21/.test(d.note));
+d = decide({ native: xrayConfig(), native_active: 'active', native_version: XRAY_NEW, port: xrayOnPort });
+assert.strictEqual(d.action, 'error', 'чужой новый Xray без явной переустановки не трогаем');
+assert(/несовместима с Leftik/.test(d.message) && /Переустановить заново/.test(d.message));
+assert.strictEqual(decide({ native: xrayConfig(), native_active: 'active', native_version: XRAY_NEW, port: xrayOnPort }, { force: true }).action, 'install');
+const amneziaNew = {
+  'docker:amnezia-xray': xrayConfig(),
+  'dockerkey:amnezia-xray:public': PUB,
+  'dockerkey:amnezia-xray:version': XRAY_NEW,
+  port: 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("docker-proxy",pid=99,fd=4))',
+};
+d = decide(amneziaNew);
+assert.strictEqual(d.action, 'error', 'новый Xray у Amnezia не берём');
+assert(/Amnezia/.test(d.message) && /8443/.test(d.message), d.message);
+d = analyzeProbe(parseProbe(probeOut({ ...amneziaNew, port: '' })), { port: 8443, force: false });
+assert.strictEqual(d.action, 'install', 'на другом порту Leftik ставит свой Xray рядом с Amnezia');
+assert.strictEqual(decide({ ...amneziaNew, 'dockerkey:amnezia-xray:version': XRAY_OLD }).action, 'reuse', 'старый Xray у Amnezia подходит');
+console.log('ok  версия Xray на сервере: совместимость с ядром Leftik');
+
+// ---- Маскировка: www.microsoft.com рвёт REALITY в Xray 26.6.27 (сертификат > 8192 байт) ----
+assert.strictEqual(DEFAULT_SNI, 'gateway.icloud.com');
+assert(BAD_MASK_SITES.includes('www.microsoft.com') && !BAD_MASK_SITES.includes(DEFAULT_SNI));
+// Так выглядели установки Leftik до исправления
+const msConfig = xrayConfig({ sni: 'www.microsoft.com' });
+d = decide({ native: msConfig, env: leftikEnv, native_active: 'active', native_version: XRAY_OLD, port: xrayOnPort });
+assert.strictEqual(d.action, 'install', 'своя установка с microsoft переставляется на новую маскировку');
+assert(/www\.microsoft\.com/.test(d.note) && /gateway\.icloud\.com/.test(d.note), d.note);
+d = decide({ native: xrayConfig(), env: leftikEnv, native_active: 'active', native_version: XRAY_OLD, port: xrayOnPort });
+assert.strictEqual(d.action, 'reuse', 'с нормальной маскировкой — просто берём ключ');
+assert.strictEqual(d.found.sni, 'gateway.icloud.com');
+d = decide({ native: msConfig, native_active: 'active', native_version: XRAY_OLD, port: xrayOnPort });
+assert.strictEqual(d.action, 'error', 'чужой Xray с microsoft не берём и не трогаем без «Переустановить»');
+console.log('ok  маскировка: проблемный www.microsoft.com заменяется');
+
 // Синтаксис bash-скриптов для сервера (если есть bash — на Windows берём из Git)
 const bash = process.platform !== 'win32'
   ? 'bash'
@@ -125,14 +189,16 @@ if (bash) {
   put(path.join(bin, 'systemctl'), 'exit 0');
   put(path.join(bin, 'pgrep'), 'exit 1');
   put(path.join(bin, 'curl'), 'exit 0');
-  put(path.join(xdir, 'xray'), [
+  const xrayStub = (ver) => put(path.join(xdir, 'xray'), [
     'case "$1" in',
+    `  version) echo "Xray ${ver} (Xray, Penetrates Everything.) abc (go1.24 linux/amd64)" ;;`,
     '  uuid) echo 0f9a2b3c-1d2e-4f50-8a9b-0c1d2e3f4a5b ;;',
     // Формат вывода Xray 26: «Password (PublicKey):» вместо «Public key:»
     `  x25519) printf 'PrivateKey: ${PRIV}\\nPassword (PublicKey): ${PUB}\\nHash32: x\\n' ;;`,
     '  run) grep -q \'"decryption": "none"\' "$4" ;;',
     'esac',
   ].join('\n'));
+  xrayStub(XRAY_VERSION.slice(1));
   const sandboxed = (xrayInstalled) => serverScript({ port: 443, sni: 'www.microsoft.com' })
     .replace('set -e\n', `set -e\nexport PATH="${px(bin)}:/usr/bin:/bin"\n`)
     .replace('/run/systemd/system', px(sysd))
@@ -149,6 +215,16 @@ if (bash) {
   const result = JSON.parse(res.out.split('\n').find((l) => l.startsWith('LEFTIK_RESULT ')).slice(14));
   assert.deepStrictEqual([result.uuid, result.pbk], ['0f9a2b3c-1d2e-4f50-8a9b-0c1d2e3f4a5b', PUB], 'ключи из вывода Xray 26');
   assert.strictEqual(JSON.parse(fs.readFileSync(path.join(conf, 'config.json'), 'utf8')).inbounds[0].streamSettings.realitySettings.privateKey, PRIV);
+  assert(!/скачиваю установщик Xray/.test(res.out), 'совместимая версия уже стоит — Xray не переустанавливаем');
+
+  // На сервере Xray 26.10 — должен вызваться официальный установщик с совместимой версией
+  xrayStub('26.10.21');
+  const argsFile = px(path.join(tmp, 'installer-args'));
+  put(path.join(bin, 'curl'), `while [ $# -gt 0 ]; do [ "$1" = -o ] && printf 'echo "$*" > ${argsFile}\\n' > "$2"; shift; done`);
+  res = runInstall(sandboxed(true));
+  assert.strictEqual(res.code, 0, res.out);
+  assert(/меняю Xray 26\.10\.21 на совместимую/.test(res.out), res.out);
+  assert.strictEqual(fs.readFileSync(path.join(tmp, 'installer-args'), 'utf8').trim(), `install --version ${XRAY_VERSION}`);
 
   // Официальный установщик Xray падает: его «error: …» должна попасть в сообщение пользователю
   put(path.join(bin, 'curl'), 'while [ $# -gt 0 ]; do [ "$1" = -o ] && printf \'echo "error: Download failed! Please check your network or try again."\\nexit 1\\n\' > "$2"; shift; done');

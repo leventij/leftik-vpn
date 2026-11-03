@@ -5,6 +5,13 @@ const crypto = require('crypto');
 
 const MARK = 'LEFTIK_PROBE ';
 
+// Сайт маскировки REALITY по умолчанию: маленький сертификат (~3,2 КБ), TLS 1.3, h2.
+// www.microsoft.com не годится: его запись с сертификатом ~8270 байт больше лимита
+// REALITY в Xray 26.6.27 (8192), и рукопожатие обрывается — клиент видит EOF (Xray-core#6356).
+const DEFAULT_SNI = 'gateway.icloud.com';
+const MAX_TARGET_RECORD = 8192;
+const BAD_MASK_SITES = ['www.microsoft.com', 'microsoft.com'];
+
 function probeScript({ port }) {
   return `#!/bin/bash
 PORT=${Number(port)}
@@ -14,6 +21,7 @@ emit() { echo "${MARK}$1 $(printf '%s' "$2" | b64)"; }
 
 [ -f $CONF_DIR/config.json ] && emit native "$(cat $CONF_DIR/config.json)"
 [ -f $CONF_DIR/leftik.env ] && emit env "$(cat $CONF_DIR/leftik.env)"
+[ -x /usr/local/bin/xray ] && emit native_version "$(/usr/local/bin/xray version 2>/dev/null | head -n 1)"
 command -v systemctl >/dev/null 2>&1 && emit native_active "$(systemctl is-active xray 2>/dev/null)"
 
 # Amnezia держит Xray в Docker-контейнере, ключи и конфиг — в /opt/amnezia/xray
@@ -23,6 +31,7 @@ if command -v docker >/dev/null 2>&1; then
     for k in uuid public short_id; do
       v=$(docker exec "$c" cat /opt/amnezia/xray/xray_$k.key 2>/dev/null) && emit "dockerkey:$c:$k" "$v"
     done
+    v=$(docker exec "$c" xray version 2>/dev/null | head -n 1) && emit "dockerkey:$c:version" "$v"
   done
 fi
 
@@ -95,16 +104,36 @@ function realityInbounds(configText) {
   });
 }
 
+// Версия Xray из «Xray 26.10.21 (Xray, Penetrates Everything.) …» → [26, 10, 21] или null
+function xrayVersion(line) {
+  const m = String(line || '').match(/Xray\s+v?(\d+)\.(\d+)\.(\d+)/i);
+  return m ? m.slice(1).map(Number) : null;
+}
+
+// Совместим ли сервер с клиентом sing-box: Xray 26.7+ отвергает его REALITY (см. XRAY_VERSION в installer.js).
+// Неизвестную версию считаем совместимой — проверка связи при подключении всё равно покажет проблему.
+function compatibleXray(version) {
+  if (!version) return true;
+  const [major, minor] = version;
+  return major < 26 || (major === 26 && minor < 7);
+}
+
 // Решение по результатам проверки: reuse (взять готовый ключ), install или error
-function analyzeProbe(probe, { port, force }) {
+function analyzeProbe(probe, { port, force, sni = DEFAULT_SNI }) {
   const found = [];
   const env = parseEnv(probe.env);
   const nativeActive = probe.native_active === 'active';
+  const nativeVer = xrayVersion(probe.native_version);
 
   if (probe.native && nativeActive) {
     for (const ib of realityInbounds(probe.native)) {
       const ours = env.UUID && env.UUID === ib.uuid;
-      found.push({ ...ib, pbk: (ours && env.PUB) || realityPublicKey(ib.privateKey), source: ours ? 'leftik' : 'xray' });
+      found.push({
+        ...ib,
+        pbk: (ours && env.PUB) || realityPublicKey(ib.privateKey),
+        source: ours ? 'leftik' : 'xray',
+        version: nativeVer,
+      });
     }
   }
   for (const [name, d] of Object.entries(probe.docker || {})) {
@@ -116,27 +145,57 @@ function analyzeProbe(probe, { port, force }) {
         pbk: d.public || realityPublicKey(ib.privateKey),
         source: 'amnezia',
         container: name,
+        version: xrayVersion(d.version),
       });
     }
   }
   const usable = found.filter((f) => f.pbk && f.uuid && f.port && f.sni);
   const order = { leftik: 0, amnezia: 1, xray: 2 };
   usable.sort((a, b) => order[a.source] - order[b.source]);
+  const badMask = (f) => BAD_MASK_SITES.includes(String(f.sni).toLowerCase());
+  const working = usable.filter((f) => compatibleXray(f.version) && !badMask(f));
+  const tooNew = usable.filter((f) => !compatibleXray(f.version));
+  const ver = (f) => f.version.join('.');
 
-  if (!force && usable.length) return { action: 'reuse', found: usable[0] };
+  if (!force && working.length) return { action: 'reuse', found: working[0] };
 
-  // Чужой конфиг Xray без Reality не трогаем без явного «переустановить»
+  // Своя установка с проблемной маскировкой — переставляем с новой (ключи сохранятся)
+  const ownBadMask = usable.find((f) => f.source === 'leftik' && badMask(f));
+  if (!force && ownBadMask && !BAD_MASK_SITES.includes(sni)) {
+    return { action: 'install', note: `Маскировка ${ownBadMask.sni} обрывает подключения (слишком большой сертификат) — меняю её на ${sni}, ключи сохранятся` };
+  }
+
+  // Свой Xray слишком новый — переставляем совместимую версию, ключи сохраняются
+  const ownTooNew = tooNew.find((f) => f.source === 'leftik');
+  if (!force && ownTooNew) {
+    return { action: 'install', note: `На сервере Xray ${ver(ownTooNew)} — он несовместим с Leftik, ставлю совместимую версию (ключи сохранятся)` };
+  }
+
+  // Чужой Xray (не Leftik) не трогаем без явного «переустановить»
   if (probe.native && !probe.env && !force) {
-    return { action: 'error', message: 'На сервере уже есть Xray с другой настройкой. Чтобы её не сломать, Leftik ничего не менял. Если её можно заменить, включите «Переустановить заново» в разделе «Дополнительно».' };
+    const foreign = tooNew.find((f) => f.source === 'xray');
+    return {
+      action: 'error',
+      message: foreign
+        ? `На сервере уже есть VLESS Reality на Xray ${ver(foreign)}, но эта версия несовместима с Leftik (новые Xray отвергают его подключение). Включите «Переустановить заново» в разделе «Дополнительно» — Leftik поставит совместимую версию, а прежний конфиг сохранит в копии.`
+        : 'На сервере уже есть Xray с другой настройкой. Чтобы её не сломать, Leftik ничего не менял. Если её можно заменить, включите «Переустановить заново» в разделе «Дополнительно».',
+    };
   }
   // Порт должен быть свободен или занят нашим же Xray (его перезапустим)
   const busy = String(probe.port || '').split(/\r?\n/).filter((l) => l.trim() && !/"xray"/.test(l));
   if (busy.length) {
     const proc = (busy[0].match(/users:\(\("([^"]+)"/) || [])[1] || 'другая программа';
+    const amnezia = tooNew.find((f) => f.source === 'amnezia' && f.port === port);
+    if (amnezia) {
+      return { action: 'error', message: `На сервере есть VLESS от Amnezia, но его Xray ${ver(amnezia)} несовместим с Leftik. Amnezia занимает порт ${port}: укажите в разделе «Дополнительно» другой порт VPN (например, 8443) — Leftik поставит рядом свой совместимый Xray, Amnezia продолжит работать.` };
+    }
     const hint = proc === 'docker-proxy' ? ' (похоже, Docker-контейнер, например Amnezia)' : '';
     return { action: 'error', message: `Порт ${port} на сервере уже занят: ${proc}${hint}. Укажите другой порт в разделе «Дополнительно».` };
   }
   return { action: 'install' };
 }
 
-module.exports = { probeScript, parseProbe, analyzeProbe, realityInbounds, realityPublicKey, MARK };
+module.exports = {
+  probeScript, parseProbe, analyzeProbe, realityInbounds, realityPublicKey, xrayVersion, compatibleXray,
+  MARK, DEFAULT_SNI, MAX_TARGET_RECORD, BAD_MASK_SITES,
+};
