@@ -7,7 +7,7 @@ const { execFileSync } = require('child_process');
 const { parseVless, buildVless } = require('../src/main/vless');
 const { buildConfig, splitRouting } = require('../src/main/singbox');
 const { ruleCommands, restoreScript, RULE } = require('../src/main/killswitch');
-const { serverScript } = require('../src/main/installer');
+const { serverScript, installError } = require('../src/main/installer');
 const { probeScript, parseProbe, analyzeProbe, realityPublicKey, MARK: PROBE_MARK } = require('../src/main/probe');
 
 const link = 'vless://0f9a2b3c-1d2e-4f50-8a9b-0c1d2e3f4a5b@203.0.113.10:443'
@@ -114,6 +114,49 @@ if (bash) {
     }
   }
   console.log('ok  bash-скрипты сервера (синтаксис и формат вывода проверки)');
+
+  // Прогон установки с заглушками вместо системных команд и Xray
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'leftik-inst-'));
+  const px = (p) => (process.platform === 'win32' ? p.replace(/\\/g, '/').replace(/^([A-Za-z]):/, (_, dr) => `/${dr.toLowerCase()}`) : p);
+  const dir = (n) => { const p = path.join(tmp, n); fs.mkdirSync(p); return p; };
+  const [bin, sysd, xdir, conf] = ['bin', 'systemd', 'xray', 'conf'].map(dir);
+  const put = (file, body) => fs.writeFileSync(file, `#!/bin/bash\n${body}\n`, { mode: 0o755 });
+  put(path.join(bin, 'id'), 'echo 0');
+  put(path.join(bin, 'systemctl'), 'exit 0');
+  put(path.join(bin, 'pgrep'), 'exit 1');
+  put(path.join(bin, 'curl'), 'exit 0');
+  put(path.join(xdir, 'xray'), [
+    'case "$1" in',
+    '  uuid) echo 0f9a2b3c-1d2e-4f50-8a9b-0c1d2e3f4a5b ;;',
+    // Формат вывода Xray 26: «Password (PublicKey):» вместо «Public key:»
+    `  x25519) printf 'PrivateKey: ${PRIV}\\nPassword (PublicKey): ${PUB}\\nHash32: x\\n' ;;`,
+    '  run) grep -q \'"decryption": "none"\' "$4" ;;',
+    'esac',
+  ].join('\n'));
+  const sandboxed = (xrayInstalled) => serverScript({ port: 443, sni: 'www.microsoft.com' })
+    .replace('set -e\n', `set -e\nexport PATH="${px(bin)}:/usr/bin:/bin"\n`)
+    .replace('/run/systemd/system', px(sysd))
+    .replace('CONF_DIR=/usr/local/etc/xray', `CONF_DIR=${px(conf)}`)
+    .replace('for p in curl unzip;', 'for p in curl;')
+    .replace(/\/usr\/local\/bin\/xray/g, xrayInstalled ? px(path.join(xdir, 'xray')) : px(path.join(tmp, 'none', 'xray')));
+  const runInstall = (text) => {
+    const r = require('child_process').spawnSync(bash, ['-s'], { input: text });
+    return { code: r.status, out: r.stdout.toString() + r.stderr.toString() };
+  };
+
+  let res = runInstall(sandboxed(true));
+  assert.strictEqual(res.code, 0, res.out);
+  const result = JSON.parse(res.out.split('\n').find((l) => l.startsWith('LEFTIK_RESULT ')).slice(14));
+  assert.deepStrictEqual([result.uuid, result.pbk], ['0f9a2b3c-1d2e-4f50-8a9b-0c1d2e3f4a5b', PUB], 'ключи из вывода Xray 26');
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(conf, 'config.json'), 'utf8')).inbounds[0].streamSettings.realitySettings.privateKey, PRIV);
+
+  // Официальный установщик Xray падает: его «error: …» должна попасть в сообщение пользователю
+  put(path.join(bin, 'curl'), 'while [ $# -gt 0 ]; do [ "$1" = -o ] && printf \'echo "error: Download failed! Please check your network or try again."\\nexit 1\\n\' > "$2"; shift; done');
+  res = runInstall(sandboxed(false));
+  assert.strictEqual(res.code, 1);
+  assert.strictEqual(installError(res), 'Установка не удалась: официальный установщик Xray: Download failed! Please check your network or try again.');
+  fs.rmSync(tmp, { recursive: true, force: true });
+  console.log('ok  установка на сервер: успешный прогон и понятная причина ошибки');
 } else {
   console.log('--  bash не найден, проверка скриптов сервера пропущена');
 }

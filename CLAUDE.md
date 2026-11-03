@@ -24,6 +24,7 @@ Desktop VPN client for Windows (Electron 44 + sing-box 1.14.3). VLESS + Reality:
 - **Restore always sets outbound to allow.** `C:\ProgramData\LeftikVPN\restore-firewall.cmd` puts the firewall back; the uninstaller runs it too.
 - **Disconnect must cancel a connect that has not spawned the core yet.** `Core.gen` handles this; the stray core is found via `core.pid`.
 - **Decorative elements over buttons need `pointer-events: none`.** The power button was unclickable because of its rings. Tests that call `.click()` from JS miss this, so hit-test with `document.elementFromPoint`.
+- **Never send server-side tool output to `/dev/null` without keeping the reason.** The official Xray installer prints its `error: …` to stdout, so the user only saw «код 1». The install script logs to `/tmp/leftik-xray-install.log` and fails through `fail "…"` (`[leftik] ОШИБКА: …`). `installError()` turns that into the message shown in the app. On a fresh VPS, wait for the apt/dpkg lock (`wait_pkg_lock`).
 - **Electron test launchers run from a scratch script** use `%APPDATA%\Electron` as userData, not the real app data.
 
 ## Not yet verified on real hardware
